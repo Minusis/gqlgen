@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/99designs/gqlgen/graphql"
+	"github.com/99designs/gqlgen/graphql/errcode"
 	"github.com/vektah/gqlparser/ast"
 	"github.com/vektah/gqlparser/gqlerror"
 	"github.com/vektah/gqlparser/parser"
@@ -120,7 +121,10 @@ func (e executor) CreateOperationContext(ctx context.Context, params *graphql.Ra
 		DisableIntrospection: true,
 		Recover:              graphql.DefaultRecover,
 		ResolverMiddleware:   e.fieldMiddleware,
-		Stats:                graphql.Stats{OperationStart: graphql.GetStartTime(ctx)},
+		Stats: graphql.Stats{
+			Read:           params.ReadTime,
+			OperationStart: graphql.GetStartTime(ctx),
+		},
 	}
 	ctx = graphql.WithOperationContext(ctx, rc)
 
@@ -147,6 +151,7 @@ func (e executor) CreateOperationContext(ctx context.Context, params *graphql.Ra
 	var err *gqlerror.Error
 	rc.Variables, err = validator.VariableValues(e.server.es.Schema(), rc.Operation, params.Variables)
 	if err != nil {
+		errcode.Set(err, errcode.ValidationFailed)
 		return rc, gqlerror.List{err}
 	}
 	rc.Stats.Validation.End = graphql.Now()
@@ -180,7 +185,7 @@ func (e executor) DispatchError(ctx context.Context, list gqlerror.List) *graphq
 func (e executor) parseQuery(ctx context.Context, stats *graphql.Stats, query string) (*ast.QueryDocument, gqlerror.List) {
 	stats.Parsing.Start = graphql.Now()
 
-	if doc, ok := e.server.queryCache.Get(query); ok {
+	if doc, ok := e.server.queryCache.Get(ctx, query); ok {
 		now := graphql.Now()
 
 		stats.Parsing.End = now
@@ -190,6 +195,7 @@ func (e executor) parseQuery(ctx context.Context, stats *graphql.Stats, query st
 
 	doc, err := parser.ParseQuery(&ast.Source{Input: query})
 	if err != nil {
+		errcode.Set(err, errcode.ParseFailed)
 		return nil, gqlerror.List{err}
 	}
 	stats.Parsing.End = graphql.Now()
@@ -197,10 +203,13 @@ func (e executor) parseQuery(ctx context.Context, stats *graphql.Stats, query st
 	stats.Validation.Start = graphql.Now()
 	listErr := validator.Validate(e.server.es.Schema(), doc)
 	if len(listErr) != 0 {
+		for _, e := range listErr {
+			errcode.Set(e, errcode.ValidationFailed)
+		}
 		return nil, listErr
 	}
 
-	e.server.queryCache.Add(query, doc)
+	e.server.queryCache.Add(ctx, query, doc)
 
 	return doc, nil
 }

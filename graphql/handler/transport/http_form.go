@@ -56,6 +56,8 @@ func (f MultipartForm) maxMemory() int64 {
 func (f MultipartForm) Do(w http.ResponseWriter, r *http.Request, exec graphql.GraphExecutor) {
 	w.Header().Set("Content-Type", "application/json")
 
+	start := graphql.Now()
+
 	var err error
 	if r.ContentLength > f.maxUploadSize() {
 		writeJsonError(w, "failed to parse multipart form, request body too large")
@@ -186,10 +188,15 @@ func (f MultipartForm) Do(w http.ResponseWriter, r *http.Request, exec graphql.G
 		}
 	}
 
+	params.ReadTime = graphql.TraceTiming{
+		Start: start,
+		End:   graphql.Now(),
+	}
+
 	rc, gerr := exec.CreateOperationContext(r.Context(), &params)
 	if gerr != nil {
 		resp := exec.DispatchError(graphql.WithOperationContext(r.Context(), rc), gerr)
-		w.WriteHeader(http.StatusUnprocessableEntity)
+		w.WriteHeader(statusFor(gerr))
 		writeJson(w, resp)
 		return
 	}
