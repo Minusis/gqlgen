@@ -2,15 +2,12 @@ package config
 
 import (
 	"fmt"
-	"go/types"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
-
-	"golang.org/x/tools/go/packages"
 
 	"github.com/99designs/gqlgen/internal/code"
 	"github.com/pkg/errors"
@@ -23,15 +20,20 @@ type Config struct {
 	SchemaFilename           StringList                 `yaml:"schema,omitempty"`
 	Exec                     PackageConfig              `yaml:"exec"`
 	Model                    PackageConfig              `yaml:"model,omitempty"`
-	Resolver                 PackageConfig              `yaml:"resolver,omitempty"`
+	Federation               PackageConfig              `yaml:"federation,omitempty"`
+	Resolver                 ResolverConfig             `yaml:"resolver,omitempty"`
 	AutoBind                 []string                   `yaml:"autobind"`
 	Models                   TypeMap                    `yaml:"models,omitempty"`
 	StructTag                string                     `yaml:"struct_tag,omitempty"`
 	Directives               map[string]DirectiveConfig `yaml:"directives,omitempty"`
 	OmitSliceElementPointers bool                       `yaml:"omit_slice_element_pointers,omitempty"`
 	SkipValidation           bool                       `yaml:"skip_validation,omitempty"`
-	Federated                bool                       `yaml:"federated,omitempty"`
 	AdditionalSources        []*ast.Source              `yaml:"-"`
+	Packages                 *code.Packages             `yaml:"-"`
+	Schema                   *ast.Schema                `yaml:"-"`
+
+	// Deprecated use Federation instead. Will be removed next release
+	Federated bool `yaml:"federated,omitempty"`
 }
 
 var cfgFilenames = []string{".gqlgen.yml", "gqlgen.yml", "gqlgen.yaml"}
@@ -43,6 +45,7 @@ func DefaultConfig() *Config {
 		Model:          PackageConfig{Filename: "models_gen.go"},
 		Exec:           PackageConfig{Filename: "generated.go"},
 		Directives:     map[string]DirectiveConfig{},
+		Models:         TypeMap{},
 	}
 }
 
@@ -138,10 +141,111 @@ func LoadConfig(filename string) (*Config, error) {
 	return config, nil
 }
 
-type PackageConfig struct {
-	Filename string `yaml:"filename,omitempty"`
-	Package  string `yaml:"package,omitempty"`
-	Type     string `yaml:"type,omitempty"`
+func (c *Config) Init() error {
+	if c.Packages == nil {
+		c.Packages = &code.Packages{}
+	}
+
+	if c.Schema == nil {
+		if err := c.LoadSchema(); err != nil {
+			return err
+		}
+	}
+
+	err := c.injectTypesFromSchema()
+	if err != nil {
+		return err
+	}
+
+	err = c.autobind()
+	if err != nil {
+		return err
+	}
+
+	c.injectBuiltins()
+
+	// prefetch all packages in one big packages.Load call
+	pkgs := []string{
+		"github.com/99designs/gqlgen/graphql",
+		"github.com/99designs/gqlgen/graphql/introspection",
+	}
+	pkgs = append(pkgs, c.Models.ReferencedPackages()...)
+	pkgs = append(pkgs, c.AutoBind...)
+	c.Packages.LoadAll(pkgs...)
+
+	//  check everything is valid on the way out
+	err = c.check()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *Config) injectTypesFromSchema() error {
+	c.Directives["goModel"] = DirectiveConfig{
+		SkipRuntime: true,
+	}
+
+	c.Directives["goField"] = DirectiveConfig{
+		SkipRuntime: true,
+	}
+
+	for _, schemaType := range c.Schema.Types {
+		if schemaType == c.Schema.Query || schemaType == c.Schema.Mutation || schemaType == c.Schema.Subscription {
+			continue
+		}
+
+		if bd := schemaType.Directives.ForName("goModel"); bd != nil {
+			if ma := bd.Arguments.ForName("model"); ma != nil {
+				if mv, err := ma.Value.Value(nil); err == nil {
+					c.Models.Add(schemaType.Name, mv.(string))
+				}
+			}
+			if ma := bd.Arguments.ForName("models"); ma != nil {
+				if mvs, err := ma.Value.Value(nil); err == nil {
+					for _, mv := range mvs.([]interface{}) {
+						c.Models.Add(schemaType.Name, mv.(string))
+					}
+				}
+			}
+		}
+
+		if schemaType.Kind == ast.Object || schemaType.Kind == ast.InputObject {
+			for _, field := range schemaType.Fields {
+				if fd := field.Directives.ForName("goField"); fd != nil {
+					forceResolver := c.Models[schemaType.Name].Fields[field.Name].Resolver
+					fieldName := c.Models[schemaType.Name].Fields[field.Name].FieldName
+
+					if ra := fd.Arguments.ForName("forceResolver"); ra != nil {
+						if fr, err := ra.Value.Value(nil); err == nil {
+							forceResolver = fr.(bool)
+						}
+					}
+
+					if na := fd.Arguments.ForName("name"); na != nil {
+						if fr, err := na.Value.Value(nil); err == nil {
+							fieldName = fr.(string)
+						}
+					}
+
+					if c.Models[schemaType.Name].Fields == nil {
+						c.Models[schemaType.Name] = TypeMapEntry{
+							Model:  c.Models[schemaType.Name].Model,
+							Fields: map[string]TypeMapField{},
+						}
+					}
+
+					c.Models[schemaType.Name].Fields[field.Name] = TypeMapField{
+						FieldName: fieldName,
+						Resolver:  forceResolver,
+					}
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 type TypeMapEntry struct {
@@ -184,95 +288,85 @@ func (a StringList) Has(file string) bool {
 	return false
 }
 
-func (c *PackageConfig) normalize() error {
-	if c.Filename == "" {
-		return errors.New("Filename is required")
-	}
-	c.Filename = abs(c.Filename)
-	// If Package is not set, first attempt to load the package at the output dir. If that fails
-	// fallback to just the base dir name of the output filename.
-	if c.Package == "" {
-		c.Package = code.NameForDir(c.Dir())
+func (c *Config) check() error {
+	if c.Models == nil {
+		c.Models = TypeMap{}
 	}
 
-	return nil
-}
-
-func (c *PackageConfig) ImportPath() string {
-	return code.ImportPathForDir(c.Dir())
-}
-
-func (c *PackageConfig) Dir() string {
-	return filepath.Dir(c.Filename)
-}
-
-func (c *PackageConfig) Check() error {
-	if strings.ContainsAny(c.Package, "./\\") {
-		return fmt.Errorf("package should be the output package name only, do not include the output filename")
-	}
-	if c.Filename != "" && !strings.HasSuffix(c.Filename, ".go") {
-		return fmt.Errorf("filename should be path to a go source file")
+	type FilenamePackage struct {
+		Filename string
+		Package  string
+		Declaree string
 	}
 
-	return c.normalize()
-}
+	fileList := map[string][]FilenamePackage{}
 
-func (c *PackageConfig) Pkg() *types.Package {
-	return types.NewPackage(c.ImportPath(), c.Dir())
-}
-
-func (c *PackageConfig) IsDefined() bool {
-	return c.Filename != ""
-}
-
-func (c *Config) Check() error {
 	if err := c.Models.Check(); err != nil {
 		return errors.Wrap(err, "config.models")
 	}
 	if err := c.Exec.Check(); err != nil {
 		return errors.Wrap(err, "config.exec")
 	}
+	fileList[c.Exec.ImportPath()] = append(fileList[c.Exec.ImportPath()], FilenamePackage{
+		Filename: c.Exec.Filename,
+		Package:  c.Exec.Package,
+		Declaree: "exec",
+	})
+
 	if c.Model.IsDefined() {
 		if err := c.Model.Check(); err != nil {
 			return errors.Wrap(err, "config.model")
 		}
+		fileList[c.Model.ImportPath()] = append(fileList[c.Model.ImportPath()], FilenamePackage{
+			Filename: c.Model.Filename,
+			Package:  c.Model.Package,
+			Declaree: "model",
+		})
 	}
 	if c.Resolver.IsDefined() {
 		if err := c.Resolver.Check(); err != nil {
 			return errors.Wrap(err, "config.resolver")
 		}
+		fileList[c.Resolver.ImportPath()] = append(fileList[c.Resolver.ImportPath()], FilenamePackage{
+			Filename: c.Resolver.Filename,
+			Package:  c.Resolver.Package,
+			Declaree: "resolver",
+		})
 	}
-
-	// check packages names against conflict, if present in the same dir
-	// and check filenames for uniqueness
-	packageConfigList := []PackageConfig{}
-	if c.Model.IsDefined() {
-		packageConfigList = append(packageConfigList, c.Model)
-	}
-	packageConfigList = append(packageConfigList, []PackageConfig{
-		c.Exec,
-		c.Resolver,
-	}...)
-	filesMap := make(map[string]bool)
-	pkgConfigsByDir := make(map[string]PackageConfig)
-	for _, current := range packageConfigList {
-		_, fileFound := filesMap[current.Filename]
-		if fileFound {
-			return fmt.Errorf("filename %s defined more than once", current.Filename)
+	if c.Federation.IsDefined() {
+		if err := c.Federation.Check(); err != nil {
+			return errors.Wrap(err, "config.federation")
 		}
-		filesMap[current.Filename] = true
-		previous, inSameDir := pkgConfigsByDir[current.Dir()]
-		if inSameDir && current.Package != previous.Package {
-			return fmt.Errorf("filenames %s and %s are in the same directory but have different package definitions", stripPath(current.Filename), stripPath(previous.Filename))
+		fileList[c.Federation.ImportPath()] = append(fileList[c.Federation.ImportPath()], FilenamePackage{
+			Filename: c.Federation.Filename,
+			Package:  c.Federation.Package,
+			Declaree: "federation",
+		})
+		if c.Federation.ImportPath() != c.Exec.ImportPath() {
+			return fmt.Errorf("federation and exec must be in the same package")
 		}
-		pkgConfigsByDir[current.Dir()] = current
+	}
+	if c.Federated {
+		return fmt.Errorf("federated has been removed, instead use\nfederation:\n    filename: path/to/federated.go")
 	}
 
-	return c.normalize()
-}
+	for importPath, pkg := range fileList {
+		for _, file1 := range pkg {
+			for _, file2 := range pkg {
+				if file1.Package != file2.Package {
+					return fmt.Errorf("%s and %s define the same import path (%s) with different package names (%s vs %s)",
+						file1.Declaree,
+						file2.Declaree,
+						importPath,
+						file1.Package,
+						file2.Package,
+					)
+				}
+			}
+		}
+	}
 
-func stripPath(path string) string {
-	return filepath.Base(path)
+	return nil
 }
 
 type TypeMap map[string]TypeMapEntry
@@ -372,53 +466,22 @@ func findCfgInDir(dir string) string {
 	return ""
 }
 
-func (c *Config) normalize() error {
-	if c.Model.IsDefined() {
-		if err := c.Model.normalize(); err != nil {
-			return errors.Wrap(err, "model")
-		}
-	}
-
-	if err := c.Exec.normalize(); err != nil {
-		return errors.Wrap(err, "exec")
-	}
-
-	if c.Resolver.IsDefined() {
-		if err := c.Resolver.normalize(); err != nil {
-			return errors.Wrap(err, "resolver")
-		}
-	}
-
-	if c.Models == nil {
-		c.Models = TypeMap{}
-	}
-
-	return nil
-}
-
-func (c *Config) Autobind(s *ast.Schema) error {
+func (c *Config) autobind() error {
 	if len(c.AutoBind) == 0 {
 		return nil
 	}
 
-	ps, err := packages.Load(&packages.Config{
-		Mode: packages.NeedName |
-			packages.NeedFiles |
-			packages.NeedCompiledGoFiles |
-			packages.NeedImports |
-			packages.NeedTypes |
-			packages.NeedTypesSizes,
-	}, c.AutoBind...)
-	if err != nil {
-		return err
-	}
+	ps := c.Packages.LoadAll(c.AutoBind...)
 
-	for _, t := range s.Types {
+	for _, t := range c.Schema.Types {
 		if c.Models.UserDefined(t.Name) {
 			continue
 		}
 
-		for _, p := range ps {
+		for i, p := range ps {
+			if p == nil {
+				return fmt.Errorf("unable to load %s - make sure you're using an import path to a package that exists", c.AutoBind[i])
+			}
 			if t := p.Types.Scope().Lookup(t.Name); t != nil {
 				c.Models.Add(t.Name(), t.Pkg().Path()+"."+t.Name())
 				break
@@ -450,7 +513,7 @@ func (c *Config) Autobind(s *ast.Schema) error {
 	return nil
 }
 
-func (c *Config) InjectBuiltins(s *ast.Schema) {
+func (c *Config) injectBuiltins() {
 	builtins := TypeMap{
 		"__Directive":         {Model: StringList{"github.com/99designs/gqlgen/graphql/introspection.Directive"}},
 		"__DirectiveLocation": {Model: StringList{"github.com/99designs/gqlgen/graphql.String"}},
@@ -491,13 +554,21 @@ func (c *Config) InjectBuiltins(s *ast.Schema) {
 	}
 
 	for typeName, entry := range extraBuiltins {
-		if t, ok := s.Types[typeName]; !c.Models.Exists(typeName) && ok && t.Kind == ast.Scalar {
+		if t, ok := c.Schema.Types[typeName]; !c.Models.Exists(typeName) && ok && t.Kind == ast.Scalar {
 			c.Models[typeName] = entry
 		}
 	}
 }
 
-func (c *Config) LoadSchema() (*ast.Schema, error) {
+func (c *Config) LoadSchema() error {
+	if c.Packages != nil {
+		c.Packages = &code.Packages{}
+	}
+
+	if err := c.check(); err != nil {
+		return err
+	}
+
 	sources := append([]*ast.Source{}, c.AdditionalSources...)
 	for _, filename := range c.SchemaFilename {
 		filename = filepath.ToSlash(filename)
@@ -513,9 +584,10 @@ func (c *Config) LoadSchema() (*ast.Schema, error) {
 
 	schema, err := gqlparser.LoadSchema(sources...)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return schema, nil
+	c.Schema = schema
+	return nil
 }
 
 func abs(path string) string {
