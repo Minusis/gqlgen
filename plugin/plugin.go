@@ -5,7 +5,7 @@ package plugin
 import (
 	"github.com/99designs/gqlgen/codegen"
 	"github.com/99designs/gqlgen/codegen/config"
-	"github.com/vektah/gqlparser/ast"
+	"github.com/vektah/gqlparser/v2/ast"
 )
 
 type Plugin interface {
@@ -20,10 +20,12 @@ type CodeGenerator interface {
 	GenerateCode(cfg *codegen.Data) error
 }
 
-type SourcesInjector interface {
-	InjectSources(cfg *config.Config)
+// EarlySourceInjector is used to inject things that are required for user schema files to compile.
+type EarlySourceInjector interface {
+	InjectSourceEarly() *ast.Source
 }
 
-type SchemaMutator interface {
-	MutateSchema(s *ast.Schema) error
+// LateSourceInjector is used to inject more sources, after we have loaded the users schema.
+type LateSourceInjector interface {
+	InjectSourceLate(schema *ast.Schema) *ast.Source
 }

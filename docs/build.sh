@@ -10,18 +10,15 @@ RESET='\033[0m'
 HOST=https://gqlgen.com
 
 VERSIONS_ARRAY=(
+    'v0.11.1'
+    'origin/master'
     'v0.10.2'
-	'master'
     'v0.9.3'
     'v0.8.3'
-    'v0.7.2'
-    'v0.6.0'
-    'v0.5.1'
-    'v0.4.4'
 )
 
 joinVersions() {
-	versions=$(printf ",%s" "${VERSIONS_ARRAY[@]}")
+	versions=$(printf ",%s" "${VERSIONS_ARRAY[@]}" | sed 's/origin\/master/master/')
 	echo "${versions:1}"
 }
 
@@ -30,6 +27,10 @@ function version { echo "$@" | gawk -F. '{ printf("%03d%03d%03d\n", $1,$2,$3); }
 rebuild() {
 	VERSION_STRING=$(joinVersions)
 	export CURRENT_VERSION=${1}
+	if [[ $CURRENT_VERSION == 'origin/master' ]] ; then
+	    CURRENT_VERSION="master"
+    fi
+
 	export VERSIONS=${VERSION_STRING}
 
     hugo --quiet --destination="public/$CURRENT_VERSION" --baseURL="$HOST/$CURRENT_VERSION/"
@@ -49,9 +50,11 @@ git fetch origin --tags
 
 for version in "${VERSIONS_ARRAY[@]}" ; do
     echo -e "$(date) $GREEN Updating docs for $version.$RESET"
-    git checkout $version
+    rm -rf content
+    git checkout $version -- content
     rebuild "$version"
 done
 
-git checkout -q "$currentBranch"
+rm -rf content
+git checkout "$currentBranch" -- content
 
